@@ -1,4 +1,11 @@
 import os
+import requests
+from typing import Dict, List, Any
+import re
+from urllib.parse import quote, urljoin
+from bs4 import BeautifulSoup
+import time
+import random
 
 from agent.tools_and_schemas import SearchQueryList, Reflection
 from dotenv import load_dotenv
@@ -7,7 +14,7 @@ from langgraph.types import Send
 from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
-from google.genai import Client
+from langchain_ollama import ChatOllama
 
 from agent.state import (
     OverallState,
@@ -23,28 +30,140 @@ from agent.prompts import (
     reflection_instructions,
     answer_instructions,
 )
-from langchain_google_genai import ChatGoogleGenerativeAI
 from agent.utils import (
-    get_citations,
     get_research_topic,
-    insert_citation_markers,
-    resolve_urls,
 )
 
 load_dotenv()
 
-if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
+if os.getenv("OLLAMA_BASE_URL") is None:
+    raise ValueError("OLLAMA_BASE_URL is not set")
 
-# Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+def get_ollama_client(model_name: str) -> ChatOllama:
+    """Get Ollama client with configuration."""
+    return ChatOllama(
+        model=model_name,
+        base_url=os.getenv("OLLAMA_BASE_URL"),
+        temperature=0.7,
+    )
+
+
+def baidu_search(query: str, num_results: int = 5) -> List[Dict[str, Any]]:
+    """
+    使用百度搜索API获取搜索结果
+    
+    Args:
+        query: 搜索关键词
+        num_results: 返回结果数量
+        
+    Returns:
+        搜索结果列表
+    """
+    try:
+        # 设置请求头，模拟浏览器访问
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
+        
+        # 构建百度搜索URL
+        encoded_query = quote(query)
+        url = f"https://www.baidu.com/s?wd={encoded_query}&pn=0&rn={num_results}"
+        
+        # 发送请求
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        response.encoding = 'utf-8'
+        
+        # 解析HTML
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        results = []
+        
+        # 查找搜索结果
+        search_results = soup.find_all('div', class_='result')
+        
+        for idx, result in enumerate(search_results[:num_results]):
+            try:
+                # 获取标题
+                title_elem = result.find('h3') or result.find('a')
+                title = title_elem.get_text(strip=True) if title_elem else f"百度搜索结果 {idx+1}"
+                
+                # 获取链接
+                link_elem = result.find('a')
+                link = link_elem.get('href', '') if link_elem else ''
+                
+                # 获取摘要
+                content_elem = result.find('div', class_='c-abstract') or result.find('span', class_='content-right_8Zs40')
+                content = content_elem.get_text(strip=True) if content_elem else ''
+                
+                # 如果没有找到内容，尝试其他选择器
+                if not content:
+                    content_elem = result.find('div', class_='c-span-last')
+                    content = content_elem.get_text(strip=True) if content_elem else f"关于'{query}'的搜索结果"
+                
+                # 清理链接（百度的链接通常是重定向链接）
+                if link.startswith('/link?url='):
+                    link = f"https://www.baidu.com{link}"
+                elif not link.startswith('http'):
+                    link = f"https://www.baidu.com/search?q={encoded_query}"
+                
+                results.append({
+                    'title': title[:200],  # 限制标题长度
+                    'content': content[:500],  # 限制内容长度
+                    'url': link,
+                    'short_url': f"[百度{idx+1}]",
+                    'source': 'baidu'
+                })
+                
+            except Exception as e:
+                print(f"解析搜索结果时出错: {e}")
+                continue
+        
+        # 如果没有找到结果，返回默认结果
+        if not results:
+            results = [{
+                'title': f"百度搜索: {query}",
+                'content': f"关于'{query}'的搜索结果。由于网络或解析问题，无法获取具体内容，但可以提供基本信息。",
+                'url': f"https://www.baidu.com/s?wd={encoded_query}",
+                'short_url': "[百度1]",
+                'source': 'baidu'
+            }]
+        
+        return results
+        
+    except requests.exceptions.RequestException as e:
+        print(f"百度搜索请求失败: {e}")
+        # 返回默认结果
+        return [{
+            'title': f"百度搜索: {query}",
+            'content': f"关于'{query}'的搜索结果。由于网络问题无法获取实时搜索结果，但这是一个常见的搜索主题。",
+            'url': f"https://www.baidu.com/s?wd={quote(query)}",
+            'short_url': "[百度1]",
+            'source': 'baidu'
+        }]
+    except Exception as e:
+        print(f"百度搜索出现未知错误: {e}")
+        # 返回默认结果
+        return [{
+            'title': f"百度搜索: {query}",
+            'content': f"关于'{query}'的搜索结果。搜索功能暂时不可用，但这是一个相关的搜索主题。",
+            'url': f"https://www.baidu.com/s?wd={quote(query)}",
+            'short_url': "[百度1]",
+            'source': 'baidu'
+        }]
 
 
 # Nodes
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
     """LangGraph node that generates search queries based on the User's question.
 
-    Uses Gemini 2.0 Flash to create an optimized search queries for web research based on
+    Uses Ollama to create optimized search queries for web research based on
     the User's question.
 
     Args:
@@ -60,13 +179,8 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
+    # init Ollama client
+    llm = get_ollama_client(configurable.query_generator_model)
     structured_llm = llm.with_structured_output(SearchQueryList)
 
     # Format the prompt
@@ -93,9 +207,9 @@ def continue_to_web_research(state: QueryGenerationState):
 
 
 def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
-    """LangGraph node that performs web research using the native Google Search API tool.
+    """LangGraph node that performs web research using Baidu search.
 
-    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
+    Executes a Baidu web search and processes the results using Ollama.
 
     Args:
         state: Current graph state containing the search query and research loop count
@@ -106,33 +220,46 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     """
     # Configure
     configurable = Configuration.from_runnable_config(config)
+    
+    # 进行百度搜索
+    print(f"正在搜索: {state['search_query']}")
+    search_results = baidu_search(state["search_query"], num_results=3)
+    
+    # 添加随机延迟避免被反爬
+    time.sleep(random.uniform(1, 3))
+    
+    # Format prompt for research analysis
     formatted_prompt = web_searcher_instructions.format(
         current_date=get_current_date(),
         research_topic=state["search_query"],
     )
-
-    # Uses the google genai client as the langchain client doesn't return grounding metadata
-    response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
-        contents=formatted_prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "temperature": 0,
-        },
-    )
-    # resolve the urls to short urls for saving tokens and time
-    resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
-    )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
+    
+    # Add search results to the prompt
+    search_content = "\n".join([
+        f"标题: {result['title']}\n内容: {result['content']}\n链接: {result['url']}\n来源: {result['source']}" 
+        for result in search_results
+    ])
+    formatted_prompt += f"\n\n百度搜索结果:\n{search_content}"
+    
+    # Get LLM response
+    llm = get_ollama_client(configurable.query_generator_model)
+    response = llm.invoke(formatted_prompt)
+    
+    # Process sources
+    sources_gathered = [
+        {
+            "title": result["title"],
+            "value": result["url"],
+            "short_url": result["short_url"],
+            "label": result["title"]
+        }
+        for result in search_results
+    ]
 
     return {
         "sources_gathered": sources_gathered,
         "search_query": [state["search_query"]],
-        "web_research_result": [modified_text],
+        "web_research_result": [response.content],
     }
 
 
@@ -163,12 +290,7 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
     # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
+    llm = get_ollama_client(reasoning_model)
     result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
 
     return {
@@ -241,13 +363,8 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
 
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
-        temperature=0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
+    # init Reasoning Model
+    llm = get_ollama_client(reasoning_model)
     result = llm.invoke(formatted_prompt)
 
     # Replace the short urls with the original urls and add all used urls to the sources_gathered
